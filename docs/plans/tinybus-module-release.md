@@ -1,11 +1,6 @@
-# Implement TinyBus Module Releases
+# TinySearch module release validation
 
-Linked specification: [`../specs/tinybus-module-release.md`](../specs/tinybus-module-release.md)
-
-1. Add the pinned TinyBus host types and module SDK as path dependencies.
-2. Export the template greeting behavior through TinyBus module ABI v1.
-3. Exercise the declared interface over the real in-memory bus.
-4. Replace TinyBus host bundles with tagged `template` module archives for
-   every supported platform runner and distribution container.
-5. Run the repository validation and coverage contracts, push `main`, and
-   trigger a patch release.
+1. Build the `tinysearch` cdylib for each release target.
+2. Package the module and manifest with the standard platform asset name.
+3. Load each package through the TinyBus host.
+4. Call `ListTools` and confirm the response decodes.

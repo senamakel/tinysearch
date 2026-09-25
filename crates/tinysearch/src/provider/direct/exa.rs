@@ -1,0 +1,74 @@
+use super::{Prepared, count, required_string, urls};
+use crate::{Error, ExecuteToolRequest, Result};
+use reqwest::Method;
+use serde_json::{Value, json};
+use std::time::Duration;
+
+pub(super) fn prepare(request: &ExecuteToolRequest, key: &str) -> Result<Prepared> {
+    let args = &request.arguments;
+    let (path, mut body) = match request.name.as_str() {
+        "exa_search" => (
+            "/search",
+            json!({"query":required_string(args,"query")?,"numResults":count(args,"max_results")}),
+        ),
+        "exa_find_similar" => (
+            "/findSimilar",
+            json!({"url":required_string(args,"url")?,"numResults":count(args,"max_results")}),
+        ),
+        "exa_get_contents" => ("/contents", json!({"urls":urls(args)?,"text":true})),
+        _ => return Err(Error::UnavailableTool(request.name.clone())),
+    };
+    if request.name == "exa_search" {
+        for (src, dst) in [
+            ("type", "type"),
+            ("category", "category"),
+            ("start_published_date", "startPublishedDate"),
+            ("end_published_date", "endPublishedDate"),
+        ] {
+            if let Some(v) = args.get(src) {
+                body[dst] = v.clone();
+            }
+        }
+    }
+    if request.name == "exa_get_contents" {
+        for (src, dst) in [
+            ("include_summary", "summary"),
+            ("include_highlights", "highlights"),
+        ] {
+            if args.get(src) == Some(&Value::Bool(true)) {
+                body[dst] = json!(true);
+            }
+        }
+    } else {
+        for (src, dst) in [
+            ("include_domains", "includeDomains"),
+            ("exclude_domains", "excludeDomains"),
+        ] {
+            if let Some(v) = args.get(src) {
+                body[dst] = v.clone();
+            }
+        }
+        if let Some(v) = args.get("exclude_source_domain") {
+            body["excludeSourceDomain"] = v.clone();
+        }
+        let mut contents = json!({});
+        if args.get("include_text") == Some(&Value::Bool(true)) {
+            contents["text"] = json!(true);
+        }
+        if args.get("include_highlights") == Some(&Value::Bool(true)) {
+            contents["highlights"] = json!(true);
+        }
+        if contents.as_object().is_some_and(|o| !o.is_empty()) {
+            body["contents"] = contents;
+        }
+    }
+    Ok((
+        Method::POST,
+        "https://api.exa.ai",
+        path.into(),
+        Some(body),
+        vec![],
+        ("x-api-key", key.into()),
+        Duration::from_secs(35),
+    ))
+}

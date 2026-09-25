@@ -1,0 +1,569 @@
+//! Built-in HTTP providers and bounded result normalization.
+use crate::{
+    BackendAuthMode, BackendConfig, Error, ExecuteToolRequest, ExecuteToolResponse, ProviderConfig,
+    ProviderFuture, ProviderRoute, Result, SearchProvider, SearchStatus,
+};
+use reqwest::{Client, Method};
+use serde_json::{Map, Value, json};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+const MAX_RESULTS: usize = 20;
+const MAX_CITATIONS: usize = 40;
+const MAX_ANSWER_CHARS: usize = 12_000;
+const MAX_BODY_BYTES: u64 = 2_000_000;
+
+#[derive(Debug)]
+struct BuiltinProvider {
+    name: &'static str,
+    client: Client,
+}
+
+/// Returns the production provider registry. Providers without suitable
+/// private configuration remain hidden by the service catalog.
+pub(crate) fn builtins() -> BTreeMap<String, Arc<dyn SearchProvider>> {
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
+    [
+        "parallel",
+        "tinyfish",
+        "gemini",
+        "gemini_deep_research",
+        "exa",
+        "brave",
+        "querit",
+        "tavily",
+        "seltz",
+        "searxng",
+    ]
+    .into_iter()
+    .map(|name| {
+        (
+            name.into(),
+            Arc::new(BuiltinProvider {
+                name,
+                client: client.clone(),
+            }) as Arc<dyn SearchProvider>,
+        )
+    })
+    .collect()
+}
+
+impl SearchProvider for BuiltinProvider {
+    fn execute<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        backend: &'a BackendConfig,
+        request: &'a ExecuteToolRequest,
+    ) -> ProviderFuture<'a> {
+        Box::pin(async move { self.run(config, backend, request).await })
+    }
+}
+
+impl BuiltinProvider {
+    async fn run(
+        &self,
+        config: &ProviderConfig,
+        backend: &BackendConfig,
+        request: &ExecuteToolRequest,
+    ) -> Result<ExecuteToolResponse> {
+        let (path, body) = match self.name {
+            "parallel" if config.route == ProviderRoute::Direct => {
+                return direct::run(&self.client, self.name, config, request).await;
+            }
+            "exa" | "brave" | "querit" | "tavily" | "seltz" | "searxng" => {
+                return direct::run(&self.client, self.name, config, request).await;
+            }
+            "parallel" => parallel_request(request)?,
+            "tinyfish" => tinyfish_request(request)?,
+            "gemini" => return self.gemini(config, backend, request).await,
+            "gemini_deep_research" => return self.deep_research(config, request).await,
+            _ => return Err(Error::UnavailableProvider(self.name.into())),
+        };
+        if config.route != ProviderRoute::Backend {
+            return Err(Error::Provider(
+                "this provider requires the backend route".into(),
+            ));
+        }
+        let value = send_json(
+            &self.client,
+            Method::POST,
+            backend_url(backend, &path)?,
+            Some(body),
+            Auth::Backend(backend),
+            if matches!(
+                request.name.as_str(),
+                "parallel_research" | "parallel_enrich"
+            ) {
+                Duration::from_secs(
+                    request
+                        .arguments
+                        .get("timeout_seconds")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(600)
+                        .min(900)
+                        + 30,
+                )
+            } else {
+                Duration::from_secs(35)
+            },
+        )
+        .await?;
+        let value = unwrap_backend(value)?;
+        if matches!(status_state(&value), Some("failed" | "cancelled" | "error")) {
+            return Err(Error::Provider("provider task failed".into()));
+        }
+        let mut response = normalize(self.name, &request.name, &value);
+        if matches!(
+            status_state(&value),
+            Some("pending" | "queued" | "running" | "in_progress")
+        ) {
+            response.status = SearchStatus::InProgress;
+        }
+        Ok(response)
+    }
+
+    async fn gemini(
+        &self,
+        config: &ProviderConfig,
+        backend: &BackendConfig,
+        request: &ExecuteToolRequest,
+    ) -> Result<ExecuteToolResponse> {
+        if request.name != "gemini_agentic_search" {
+            return Err(Error::UnavailableTool(request.name.clone()));
+        }
+        let query = required_string(&request.arguments, "query")?;
+        let model = request
+            .arguments
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("gemini-3.8-flash");
+        if !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+        {
+            return Err(Error::InvalidArguments);
+        }
+        let tools = if config.route == ProviderRoute::Backend {
+            json!([{"googleSearch":{}}])
+        } else {
+            json!([{"google_search":{}}])
+        };
+        let body = json!({"contents":[{"parts":[{"text":query}]}],"tools":tools});
+        let (url, auth) = match config.route {
+            ProviderRoute::Backend => (
+                backend_url(
+                    backend,
+                    &format!("/agent-integrations/gemini/models/{model}/generate-content"),
+                )?,
+                Auth::Backend(backend),
+            ),
+            ProviderRoute::Direct => (
+                direct_url(
+                    config.base_url.as_deref(),
+                    "https://generativelanguage.googleapis.com",
+                    &format!("/v1beta/models/{model}:generateContent"),
+                )?,
+                Auth::Google(
+                    config
+                        .credential
+                        .as_deref()
+                        .ok_or_else(|| Error::Provider("Gemini credential unavailable".into()))?,
+                ),
+            ),
+        };
+        let is_backend = matches!(config.route, ProviderRoute::Backend);
+        let value = send_json(
+            &self.client,
+            Method::POST,
+            url,
+            Some(body),
+            auth,
+            Duration::from_secs(35),
+        )
+        .await?;
+        let value = if is_backend {
+            unwrap_backend(value)?
+        } else {
+            value
+        };
+        Ok(normalize("gemini", &request.name, &value))
+    }
+
+    async fn deep_research(
+        &self,
+        config: &ProviderConfig,
+        request: &ExecuteToolRequest,
+    ) -> Result<ExecuteToolResponse> {
+        if request.name != "gemini_deep_research" {
+            return Err(Error::UnavailableTool(request.name.clone()));
+        }
+        if config.route != ProviderRoute::Direct {
+            return Err(Error::Provider(
+                "Deep Research requires a direct Gemini route".into(),
+            ));
+        }
+        let key = config
+            .credential
+            .as_deref()
+            .ok_or_else(|| Error::Provider("Gemini credential unavailable".into()))?;
+        let base = config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://generativelanguage.googleapis.com");
+        let resume_id = request
+            .arguments
+            .get("interaction_id")
+            .and_then(Value::as_str);
+        let mut value = if let Some(id) = resume_id {
+            validate_interaction_id(id)?;
+            let url = direct_url(Some(base), base, &format!("/v1beta/interactions/{id}"))?;
+            send_json(
+                &self.client,
+                Method::GET,
+                url,
+                None,
+                Auth::Google(key),
+                Duration::from_secs(35),
+            )
+            .await?
+        } else {
+            let query = required_string(&request.arguments, "query")?;
+            let url = direct_url(Some(base), base, "/v1beta/interactions")?;
+            let body =
+                json!({"input":query,"agent":"deep-research-preview-04-2026","background":true});
+            send_json(
+                &self.client,
+                Method::POST,
+                url,
+                Some(body),
+                Auth::Google(key),
+                Duration::from_secs(35),
+            )
+            .await?
+        };
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .or(resume_id)
+            .ok_or_else(|| Error::Provider("Deep Research response omitted interaction id".into()))?
+            .to_owned();
+        validate_interaction_id(&id)?;
+        let max_attempts = request
+            .arguments
+            .get("max_poll_attempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .min(30);
+        for attempt in 0..=max_attempts {
+            match value.get("status").and_then(Value::as_str).unwrap_or("") {
+                "completed" => return Ok(normalize("gemini_deep_research", &request.name, &value)),
+                "failed" | "cancelled" => {
+                    return Err(Error::Provider("Deep Research task failed".into()));
+                }
+                _ => {}
+            }
+            if attempt == max_attempts {
+                break;
+            }
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            let url = direct_url(Some(base), base, &format!("/v1beta/interactions/{id}"))?;
+            value = send_json(
+                &self.client,
+                Method::GET,
+                url,
+                None,
+                Auth::Google(key),
+                Duration::from_secs(35),
+            )
+            .await?;
+        }
+        let mut response = normalize("gemini_deep_research", &request.name, &value);
+        response.status = SearchStatus::InProgress;
+        response.answer = None;
+        response.provider_data = Some(json!({"interaction_id":id,"status":"in_progress"}));
+        Ok(response)
+    }
+}
+
+fn status_state(value: &Value) -> Option<&str> {
+    value.get("status").and_then(|status| {
+        status
+            .as_str()
+            .or_else(|| status.get("state").and_then(Value::as_str))
+    })
+}
+
+fn validate_interaction_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Error::Provider(
+            "invalid Deep Research interaction id".into(),
+        ));
+    }
+    Ok(())
+}
+
+enum Auth<'a> {
+    Backend(&'a BackendConfig),
+    Google(&'a str),
+}
+fn backend_url(config: &BackendConfig, path: &str) -> Result<String> {
+    let base = config
+        .base_url
+        .as_deref()
+        .ok_or_else(|| Error::Provider("backend URL unavailable".into()))?;
+    direct_url(Some(base), base, path)
+}
+fn direct_url(override_base: Option<&str>, default_base: &str, path: &str) -> Result<String> {
+    let base = override_base.unwrap_or(default_base);
+    let url =
+        reqwest::Url::parse(base).map_err(|_| Error::Provider("invalid provider URL".into()))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Error::Provider("invalid provider URL".into()));
+    }
+    Ok(format!("{}{}", base.trim_end_matches('/'), path))
+}
+async fn send_json(
+    client: &Client,
+    method: Method,
+    url: String,
+    body: Option<Value>,
+    auth: Auth<'_>,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut request = client
+        .request(method, url)
+        .timeout(timeout)
+        .header(reqwest::header::ACCEPT, "application/json");
+    request = match auth {
+        Auth::Backend(config) => {
+            let credential = config
+                .credential
+                .as_deref()
+                .ok_or_else(|| Error::Provider("backend credential unavailable".into()))?;
+            let mut req = match config.auth_mode {
+                BackendAuthMode::Session => request.bearer_auth(credential),
+                BackendAuthMode::ApiKey => request.header("x-api-key", credential),
+            };
+            if let Some(name) = config.sdk_name.as_deref() {
+                req = req.header("x-sdk-name", name);
+            }
+            req
+        }
+        Auth::Google(key) => request.header("x-goog-api-key", key),
+    };
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|_| Error::Provider("provider transport failed".into()))?;
+    if !response.status().is_success() {
+        return Err(Error::Provider(format!(
+            "provider returned HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BODY_BYTES)
+    {
+        return Err(Error::Provider("provider response too large".into()));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| Error::Provider("provider response read failed".into()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) as u64 > MAX_BODY_BYTES {
+            return Err(Error::Provider("provider response too large".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| Error::Provider("provider returned invalid JSON".into()))
+}
+
+fn unwrap_backend(mut value: Value) -> Result<Value> {
+    if value.get("success") == Some(&Value::Bool(false)) {
+        return Err(Error::Provider("backend rejected provider request".into()));
+    }
+    if value.get("success") == Some(&Value::Bool(true))
+        && let Some(data) = value.as_object_mut().and_then(|o| o.remove("data"))
+    {
+        return Ok(data);
+    }
+    Ok(value)
+}
+
+fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(Error::InvalidArguments)
+}
+fn mapped(args: &Value, pairs: &[(&str, &str)]) -> Value {
+    let mut body = Map::new();
+    for (source, target) in pairs {
+        if let Some(value) = args.get(*source) {
+            body.insert((*target).into(), value.clone());
+        }
+    }
+    Value::Object(body)
+}
+fn parallel_request(request: &ExecuteToolRequest) -> Result<(String, Value)> {
+    let args = &request.arguments;
+    let (path, mut body) = match request.name.as_str() {
+        "parallel_search" => {
+            required_string(args, "objective")?;
+            let mut body = mapped(
+                args,
+                &[
+                    ("objective", "objective"),
+                    ("search_queries", "searchQueries"),
+                    ("mode", "mode"),
+                ],
+            );
+            let excerpt = mapped(
+                args,
+                &[
+                    ("num_results", "numResults"),
+                    ("max_characters_per_excerpt", "maxCharactersPerExcerpt"),
+                ],
+            );
+            if excerpt.as_object().is_some_and(|o| !o.is_empty()) {
+                body["excerpts"] = excerpt;
+            }
+            ("search", body)
+        }
+        "parallel_extract" => (
+            "extract",
+            mapped(
+                args,
+                &[
+                    ("urls", "urls"),
+                    ("objective", "objective"),
+                    ("excerpts", "excerpts"),
+                    ("full_content", "fullContent"),
+                ],
+            ),
+        ),
+        "parallel_chat" => (
+            "chat",
+            mapped(args, &[("model", "model"), ("messages", "messages")]),
+        ),
+        "parallel_research" => (
+            "research",
+            mapped(
+                args,
+                &[
+                    ("input", "input"),
+                    ("processor", "processor"),
+                    ("output_schema", "outputSchema"),
+                    ("timeout_seconds", "timeoutSeconds"),
+                ],
+            ),
+        ),
+        "parallel_enrich" => (
+            "enrich",
+            mapped(
+                args,
+                &[
+                    ("input", "input"),
+                    ("processor", "processor"),
+                    ("output_schema", "outputSchema"),
+                    ("timeout_seconds", "timeoutSeconds"),
+                ],
+            ),
+        ),
+        "parallel_dataset" => (
+            "dataset",
+            mapped(
+                args,
+                &[
+                    ("objective", "objective"),
+                    ("entity_type", "entityType"),
+                    ("match_conditions", "matchConditions"),
+                    ("generator", "generator"),
+                    ("match_limit", "matchLimit"),
+                ],
+            ),
+        ),
+        _ => return Err(Error::UnavailableTool(request.name.clone())),
+    };
+    if request.name == "parallel_research" {
+        body["wait"] = json!(true);
+    }
+    Ok((format!("/agent-integrations/parallel/{path}"), body))
+}
+fn tinyfish_request(request: &ExecuteToolRequest) -> Result<(String, Value)> {
+    let args = &request.arguments;
+    let (path, mut body) = match request.name.as_str() {
+        "tinyfish_search" => (
+            "search",
+            mapped(
+                args,
+                &[
+                    ("query", "query"),
+                    ("location", "location"),
+                    ("language", "language"),
+                    ("page", "page"),
+                    ("include_thumbnail", "include_thumbnail"),
+                ],
+            ),
+        ),
+        "tinyfish_fetch" => (
+            "fetch",
+            mapped(
+                args,
+                &[
+                    ("urls", "urls"),
+                    ("format", "format"),
+                    ("links", "links"),
+                    ("image_links", "image_links"),
+                ],
+            ),
+        ),
+        "tinyfish_agent_run" => (
+            "agent/run",
+            mapped(
+                args,
+                &[
+                    ("url", "url"),
+                    ("goal", "goal"),
+                    ("output_schema", "output_schema"),
+                    ("browser_profile", "browser_profile"),
+                    ("use_vault", "use_vault"),
+                    ("credential_item_ids", "credential_item_ids"),
+                ],
+            ),
+        ),
+        _ => return Err(Error::UnavailableTool(request.name.clone())),
+    };
+    if let Some(country) = args.get("proxy_country_code") {
+        body["proxy_config"] = json!({"enabled":true,"type":"tetra","country_code":country});
+    }
+    Ok((format!("/agent-integrations/tinyfish/{path}"), body))
+}
+
+mod normalize;
+use normalize::normalize;
+mod direct;
+
+#[cfg(test)]
+mod test;
