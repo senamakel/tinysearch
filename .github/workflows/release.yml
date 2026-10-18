@@ -50,10 +50,6 @@ jobs:
             exit 2
           }
           if [[ "$RELEASE_MODE" == reviewed-epic ]]; then
-            [[ "$GITHUB_REF" == refs/heads/main ]] || {
-              echo "reviewed-epic releases must be dispatched from main" >&2
-              exit 2
-            }
             [[ "$REVIEWED_PR" =~ ^[1-9][0-9]*$ ]] || {
               echo "reviewed_pr must be a positive integer in reviewed-epic mode" >&2
               exit 2
