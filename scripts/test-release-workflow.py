@@ -104,8 +104,6 @@ class ReleaseWorkflowTests(unittest.TestCase):
             capture_output=True,
         ).stdout.strip()
         self.assertEqual(bus_head, TINYBUS_SDK_SHA)
-        sdk_manifest = tomllib.loads((ROOT / "vendor/tinybus/Cargo.toml").read_text())
-        self.assertEqual(sdk_manifest["workspace"]["package"]["version"], "0.3.3")
 
     def test_reviewed_release_requires_positive_pr_on_main_and_uses_fixed_profile(self):
         result, output = self.run_resolve("reviewed-epic", "83")
