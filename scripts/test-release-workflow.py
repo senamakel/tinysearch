@@ -76,6 +76,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("module-e2e-script: scripts/test-e2e.sh", self.ci_workflow)
         self.assertIn("feature-test-script: scripts/test-features.sh", self.ci_workflow)
 
+    def test_release_workflow_test_job_checks_out_pinned_tinybus_submodule(self):
+        job = self.ci_workflow.split("  release-workflow-tests:\n", 1)[1].split(
+            "  module-ci:\n", 1
+        )[0]
+        checkout = job.split("      - uses: actions/checkout@", 1)[1].split(
+            "      - name:", 1
+        )[0]
+        self.assertIn("persist-credentials: false", checkout)
+        self.assertIn("submodules: recursive", checkout)
+
     def test_published_candidate_and_sdk_constraints_match_released_compatibility(self):
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(manifest["workspace"]["package"]["version"], "0.5.2")
