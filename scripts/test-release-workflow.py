@@ -128,9 +128,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 result, _ = self.run_resolve("reviewed-epic", reviewed_pr)
                 self.assertNotEqual(result.returncode, 0)
 
-    def test_reviewed_release_rejects_dispatch_outside_main(self):
-        result, _ = self.run_resolve("reviewed-epic", "83", "refs/heads/feature")
-        self.assertNotEqual(result.returncode, 0)
+    def test_reviewed_release_accepts_dispatch_from_canonical_epic_branch(self):
+        result, output = self.run_resolve(
+            "reviewed-epic", "83", "refs/heads/epic/8056-modules-wiring"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("release_mode=reviewed-epic", output)
+        self.assertIn("reviewed_pr=83", output)
 
 
 if __name__ == "__main__":
