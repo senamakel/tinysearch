@@ -17,6 +17,18 @@ ORDINARY_RELEASE_SHA = "4adc1080fb495098e7af1aade82ed7e6e3c69bb7"
 TINYBUS_SDK_SHA = "207a9a7df15e44fdba00a807d0f7eaf21904ba0e"
 
 
+def has_expected_sdk_gitlink(entry, expected_sha):
+    """Match the SDK pin from the parent Git tree, even without checkout."""
+    fields = entry.split()
+    return (
+        len(fields) == 4
+        and fields[0] == "160000"
+        and fields[1] == "commit"
+        and fields[2] == expected_sha
+        and fields[3] == "vendor/tinybus"
+    )
+
+
 def resolve_script(workflow):
     match = re.search(
         r"(?ms)^      - id: tag\n.*?^        run: \|\n((?:^          .*\n|^\n)+)",
@@ -97,13 +109,26 @@ class ReleaseWorkflowTests(unittest.TestCase):
             manifest["workspace"]["dependencies"]["tinybus-module"]["version"],
             ">=0.3.3, <0.4",
         )
-        bus_head = subprocess.run(
-            ["git", "-C", str(ROOT / "vendor/tinybus"), "rev-parse", "HEAD"],
+        sdk_gitlink = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-tree", "HEAD", "vendor/tinybus"],
             check=True,
             text=True,
             capture_output=True,
-        ).stdout.strip()
-        self.assertEqual(bus_head, TINYBUS_SDK_SHA)
+        ).stdout
+        self.assertTrue(has_expected_sdk_gitlink(sdk_gitlink, TINYBUS_SDK_SHA))
+
+    def test_sdk_gitlink_guard_accepts_exact_and_rejects_stale_or_missing_pins(self):
+        exact = f"160000 commit {TINYBUS_SDK_SHA}\tvendor/tinybus"
+        stale = "160000 commit cba2de0e573f99fe4c7e45ba14e2d6b5a2a7757f\tvendor/tinybus"
+
+        self.assertTrue(has_expected_sdk_gitlink(exact, TINYBUS_SDK_SHA))
+        self.assertFalse(has_expected_sdk_gitlink(stale, TINYBUS_SDK_SHA))
+        self.assertFalse(has_expected_sdk_gitlink("", TINYBUS_SDK_SHA))
+        self.assertFalse(
+            has_expected_sdk_gitlink(
+                f"100644 blob {TINYBUS_SDK_SHA}\tvendor/tinybus", TINYBUS_SDK_SHA
+            )
+        )
 
     def test_reviewed_release_requires_positive_pr_on_main_and_uses_fixed_profile(self):
         result, output = self.run_resolve("reviewed-epic", "83")
