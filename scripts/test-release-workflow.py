@@ -12,7 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/release.yml"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
-REVIEWED_RELEASE_SHA = "e045fc567c583a1b83dc9c1edef896179853fa69"
+REVIEWED_RELEASE_SHA = "6ed83b04aab2d8977ec62e966cb914531e534fa4"
 ORDINARY_RELEASE_SHA = "4adc1080fb495098e7af1aade82ed7e6e3c69bb7"
 TINYBUS_SDK_SHA = "cba2de0e573f99fe4c7e45ba14e2d6b5a2a7757f"
 
