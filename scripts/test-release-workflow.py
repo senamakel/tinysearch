@@ -59,6 +59,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_ordinary_tag_release_route_and_module_ci_pin_are_preserved(self):
         self.assertIn("push:\n    tags: ['v*']", self.workflow)
         self.assertIn("github.event_name == 'push' && github.ref_name || inputs.tag", self.workflow)
+        self.assertIn(
+            "github.event_name == 'push' && 'main' || inputs.release_mode",
+            self.workflow,
+        )
         self.assertIn("release_mode=main", self.run_resolve("main")[1])
         self.assertIn(
             f"uses: tinyhumansai/.github/.github/workflows/module-release.yml@{ORDINARY_RELEASE_SHA}",
@@ -102,11 +106,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "module-reviewed-epic-release.yml@" + REVIEWED_RELEASE_SHA,
             self.workflow,
         )
-        self.assertIn("module-crate: tinysearch", self.workflow)
-        self.assertIn("reviewed-pr: ${{ fromJSON(needs.resolve.outputs.reviewed_pr)", self.workflow)
-        self.assertNotIn("module-crate:", self.workflow.split("module-reviewed-epic-release:", 1)[1])
-        self.assertNotIn("asset-name:", self.workflow)
-        self.assertNotIn("apt-packages:", self.workflow)
+        reviewed_job = self.workflow.split("  module-reviewed-epic-release:\n", 1)[1]
+        self.assertIn("pull-requests: read", reviewed_job)
+        self.assertIn("checks: read", reviewed_job)
+        self.assertIn("actions: read", reviewed_job)
+        ordinary_job = self.workflow.split("  module-release:\n", 1)[1].split(
+            "  module-reviewed-epic-release:", 1
+        )[0]
+        self.assertIn("module-crate: tinysearch", ordinary_job)
+        self.assertIn(
+            "reviewed-pr: ${{ fromJSON(needs.resolve.outputs.reviewed_pr)",
+            reviewed_job,
+        )
+        self.assertNotIn("module-crate:", reviewed_job)
+        self.assertNotIn("asset-name:", reviewed_job)
+        self.assertNotIn("apt-packages:", reviewed_job)
 
     def test_reviewed_release_rejects_missing_zero_and_noninteger_pr(self):
         for reviewed_pr in ("", "0", "-1", "1.5", "one"):
