@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -13,6 +14,7 @@ WORKFLOW = ROOT / ".github/workflows/release.yml"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 REVIEWED_RELEASE_SHA = "e045fc567c583a1b83dc9c1edef896179853fa69"
 ORDINARY_RELEASE_SHA = "4adc1080fb495098e7af1aade82ed7e6e3c69bb7"
+TINYBUS_SDK_SHA = "cba2de0e573f99fe4c7e45ba14e2d6b5a2a7757f"
 
 
 def resolve_script(workflow):
@@ -69,6 +71,25 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("coverage-script: scripts/check-coverage.sh", self.ci_workflow)
         self.assertIn("module-e2e-script: scripts/test-e2e.sh", self.ci_workflow)
         self.assertIn("feature-test-script: scripts/test-features.sh", self.ci_workflow)
+
+    def test_published_candidate_and_sdk_constraints_match_released_compatibility(self):
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        self.assertEqual(manifest["workspace"]["package"]["version"], "0.5.2")
+        self.assertEqual(
+            manifest["workspace"]["dependencies"]["tinybus"]["version"],
+            ">=0.3.2, <0.4",
+        )
+        self.assertEqual(
+            manifest["workspace"]["dependencies"]["tinybus-module"]["version"],
+            ">=0.3.2, <0.4",
+        )
+        bus_head = subprocess.run(
+            ["git", "-C", str(ROOT / "vendor/tinybus"), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        self.assertEqual(bus_head, TINYBUS_SDK_SHA)
 
     def test_reviewed_release_requires_positive_pr_on_main_and_uses_fixed_profile(self):
         result, output = self.run_resolve("reviewed-epic", "83")
