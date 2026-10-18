@@ -14,7 +14,7 @@ WORKFLOW = ROOT / ".github/workflows/release.yml"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 REVIEWED_RELEASE_SHA = "6ed83b04aab2d8977ec62e966cb914531e534fa4"
 ORDINARY_RELEASE_SHA = "4adc1080fb495098e7af1aade82ed7e6e3c69bb7"
-TINYBUS_SDK_SHA = "cba2de0e573f99fe4c7e45ba14e2d6b5a2a7757f"
+TINYBUS_SDK_SHA = "207a9a7df15e44fdba00a807d0f7eaf21904ba0e"
 
 
 def resolve_script(workflow):
@@ -91,11 +91,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(manifest["workspace"]["package"]["version"], "0.5.2")
         self.assertEqual(
             manifest["workspace"]["dependencies"]["tinybus"]["version"],
-            ">=0.3.2, <0.4",
+            ">=0.3.3, <0.4",
         )
         self.assertEqual(
             manifest["workspace"]["dependencies"]["tinybus-module"]["version"],
-            ">=0.3.2, <0.4",
+            ">=0.3.3, <0.4",
         )
         bus_head = subprocess.run(
             ["git", "-C", str(ROOT / "vendor/tinybus"), "rev-parse", "HEAD"],
@@ -104,6 +104,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
             capture_output=True,
         ).stdout.strip()
         self.assertEqual(bus_head, TINYBUS_SDK_SHA)
+        sdk_manifest = tomllib.loads((ROOT / "vendor/tinybus/Cargo.toml").read_text())
+        self.assertEqual(sdk_manifest["workspace"]["package"]["version"], "0.3.3")
 
     def test_reviewed_release_requires_positive_pr_on_main_and_uses_fixed_profile(self):
         result, output = self.run_resolve("reviewed-epic", "83")
