@@ -14,7 +14,7 @@ WORKFLOW = ROOT / ".github/workflows/release.yml"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 REVIEWED_RELEASE_SHA = "6ed83b04aab2d8977ec62e966cb914531e534fa4"
 ORDINARY_RELEASE_SHA = "4adc1080fb495098e7af1aade82ed7e6e3c69bb7"
-TINYBUS_SDK_SHA = "207a9a7df15e44fdba00a807d0f7eaf21904ba0e"
+TINYBUS_SDK_SHA = "34d3bd6dda099e54cee11a2f96f28a21da9e0759"
 
 
 def has_expected_sdk_gitlink(entry, expected_sha):
